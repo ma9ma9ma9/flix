@@ -1,6 +1,6 @@
 import subprocess
-import signal
-import requests
+import threading
+import time
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -15,8 +15,9 @@ UID_MAP = {
     "04:36:41:2f:4e:61:80": "0367258676e12c89b1ca3d407b6f1b56",
 }
 
-# Track the current VLC process so we can stop it
+# Track the current VLC process and what's playing
 vlc_process = None
+current_item_id = None
 
 
 def cec_tv_on():
@@ -31,19 +32,45 @@ def cec_tv_on():
     )
 
 
+def cec_tv_power_status():
+    """Return the TV power status string, e.g. 'on', 'standby'."""
+    result = subprocess.run(
+        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
+        input="pow 0\n",
+        text=True,
+        timeout=10,
+        capture_output=True,
+    )
+    for line in result.stdout.splitlines():
+        if "power status:" in line:
+            return line.split("power status:")[-1].strip()
+    return "unknown"
+
+
 def kill_vlc():
-    global vlc_process
+    global vlc_process, current_item_id
     if vlc_process and vlc_process.poll() is None:
         vlc_process.terminate()
         vlc_process.wait(timeout=5)
     vlc_process = None
+    current_item_id = None
     # Kill any orphaned VLC processes from previous sessions
-    subprocess.run(["pkill", "-f", "cvlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-f", "/usr/bin/vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cec_monitor():
+    """Background thread: poll TV power status and stop VLC if TV turns off."""
+    while True:
+        time.sleep(5)
+        if vlc_process and vlc_process.poll() is None:
+            status = cec_tv_power_status()
+            if status != "on":
+                kill_vlc()
 
 
 @app.route("/play", methods=["POST"])
 def play():
-    global vlc_process
+    global vlc_process, current_item_id
 
     data = request.get_json()
     uid = data.get("uid", "").strip()
@@ -51,6 +78,10 @@ def play():
     item_id = UID_MAP.get(uid)
     if not item_id:
         return jsonify({"error": f"Unknown UID: {uid}"}), 404
+
+    # Ignore if this item is already playing
+    if item_id == current_item_id and vlc_process and vlc_process.poll() is None:
+        return jsonify({"status": "already_playing", "item_id": item_id})
 
     # Build the direct stream URL
     stream_url = (
@@ -83,6 +114,7 @@ def play():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    current_item_id = item_id
 
     return jsonify({"status": "playing", "item_id": item_id, "pid": vlc_process.pid})
 
@@ -94,4 +126,8 @@ def stop():
 
 
 if __name__ == "__main__":
+    # Kill any orphaned VLC from previous sessions on startup
+    subprocess.run(["pkill", "-f", "/usr/bin/vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Start CEC monitor thread
+    threading.Thread(target=cec_monitor, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
