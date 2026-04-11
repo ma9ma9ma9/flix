@@ -24,7 +24,15 @@ def cec_tv_on():
     """Turn on the TV and switch to this Pi's HDMI input."""
     subprocess.run(
         ["cec-client", "-s", "-d", "1", CEC_DEVICE],
-        input="on 0\nas\n",
+        input="on 0\n",
+        text=True,
+        timeout=10,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
+        input="as\n",
         text=True,
         timeout=10,
         stdout=subprocess.DEVNULL,
