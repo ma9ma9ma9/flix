@@ -13,6 +13,10 @@ JELLYFIN_USER_ID = "6a88eece9ca74c3db6f52ff5d1850111"
 # NFC UID -> Jellyfin item ID mapping
 UID_MAP = {
     "04:36:41:2f:4e:61:80": "0367258676e12c89b1ca3d407b6f1b56",
+    "04:2e:64:76:1e:61:81": "c8c2d18a2ce6c9c8090937f0f4ba2db6",
+    "04:fc:c8:3f:4e:61:80": "eba4cbb385b261f1156e8b07a0dd26af",
+    "04:a1:09:75:1e:61:80": "357f19ef861a93f671463203ead75d5c",
+    "04:41:19:7c:1e:61:81": "e85cf0e786f4c58fcaa22ecc77ee134a",
 }
 
 # Track the current VLC process and what's playing
