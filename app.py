@@ -1,6 +1,9 @@
+import base64
+import re
 import subprocess
 import threading
-import time
+import urllib.parse
+import urllib.request
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -9,6 +12,9 @@ JELLYFIN_URL = "http://192.168.50.13:8096"
 CEC_DEVICE = "/dev/cec1"
 JELLYFIN_API_KEY = "da2d114027b54d8abc4b9b38cb3faac4"
 JELLYFIN_USER_ID = "6a88eece9ca74c3db6f52ff5d1850111"
+
+VLC_HTTP_PORT = 8080
+VLC_HTTP_PASSWORD = "flix"
 
 # NFC UID -> Jellyfin item ID mapping
 UID_MAP = {
@@ -23,61 +29,117 @@ UID_MAP = {
 vlc_process = None
 current_item_id = None
 
+# Long-running cec-client for both sending commands and receiving remote key events
+cec_process = None
+cec_stdin_lock = threading.Lock()
+
+# CEC opcodes and user-control key codes we care about
+CEC_OP_STANDBY = 0x36
+CEC_OP_USER_CONTROL_PRESSED = 0x44
+
+CEC_KEY_PLAY = 0x44
+CEC_KEY_STOP = 0x45
+CEC_KEY_PAUSE = 0x46
+CEC_KEY_REWIND = 0x48
+CEC_KEY_FAST_FORWARD = 0x49
+CEC_KEY_PLAY_FUNCTION = 0x60
+CEC_KEY_PAUSE_PLAY_FUNCTION = 0x61
+CEC_KEY_STOP_FUNCTION = 0x64
+
+# Matches cec-client TRAFFIC lines like: ">> 0f:36" or ">> 0f:44:44"
+TRAFFIC_RE = re.compile(r">>\s+([0-9a-f]{2}):([0-9a-f]{2})(?::([0-9a-f]{2}))?")
+
+
+def cec_start():
+    """Start the long-running cec-client subprocess and reader thread."""
+    global cec_process
+    cec_process = subprocess.Popen(
+        ["stdbuf", "-oL", "cec-client", "-d", "8", CEC_DEVICE],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    threading.Thread(target=cec_reader, daemon=True).start()
+
+
+def cec_send(command):
+    """Send a command line to the running cec-client."""
+    with cec_stdin_lock:
+        try:
+            cec_process.stdin.write(command + "\n")
+            cec_process.stdin.flush()
+        except Exception:
+            pass
+
 
 def cec_tv_on():
     """Turn on the TV and switch to this Pi's HDMI input."""
-    subprocess.run(
-        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
-        input="on 0\n",
-        text=True,
-        timeout=10,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
-        input="as\n",
-        text=True,
-        timeout=10,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    cec_send("on 0")
+    cec_send("as")
 
 
-def cec_tv_power_status():
-    """Return the TV power status string, e.g. 'on', 'standby'."""
-    result = subprocess.run(
-        ["cec-client", "-s", "-d", "1", CEC_DEVICE],
-        input="pow 0\n",
-        text=True,
-        timeout=10,
-        capture_output=True,
-    )
-    for line in result.stdout.splitlines():
-        if "power status:" in line:
-            return line.split("power status:")[-1].strip()
-    return "unknown"
+def cec_reader():
+    """Parse cec-client output for remote key events and TV standby broadcasts."""
+    for line in cec_process.stdout:
+        m = TRAFFIC_RE.search(line)
+        if not m:
+            continue
+        addr = int(m.group(1), 16)
+        opcode = int(m.group(2), 16)
+        operand = int(m.group(3), 16) if m.group(3) else None
+        src = addr >> 4
+
+        if opcode == CEC_OP_STANDBY and src == 0:
+            # TV is going to standby — stop playback
+            kill_vlc()
+        elif opcode == CEC_OP_USER_CONTROL_PRESSED and operand is not None:
+            handle_remote_key(operand)
+
+
+def handle_remote_key(code):
+    """Map a CEC user-control key code to a VLC action."""
+    if code in (
+        CEC_KEY_PLAY,
+        CEC_KEY_PAUSE,
+        CEC_KEY_PLAY_FUNCTION,
+        CEC_KEY_PAUSE_PLAY_FUNCTION,
+    ):
+        vlc_command("pl_pause")
+    elif code in (CEC_KEY_STOP, CEC_KEY_STOP_FUNCTION):
+        kill_vlc()
+    elif code == CEC_KEY_FAST_FORWARD:
+        vlc_command("seek", "+30")
+    elif code == CEC_KEY_REWIND:
+        vlc_command("seek", "-10")
+
+
+def vlc_command(command, val=None):
+    """Send a command to VLC via its HTTP interface."""
+    url = f"http://127.0.0.1:{VLC_HTTP_PORT}/requests/status.xml?command={command}"
+    if val is not None:
+        url += f"&val={urllib.parse.quote(val)}"
+    auth = base64.b64encode(f":{VLC_HTTP_PASSWORD}".encode()).decode()
+    req = urllib.request.Request(url, headers={"Authorization": f"Basic {auth}"})
+    try:
+        urllib.request.urlopen(req, timeout=2).read()
+    except Exception:
+        pass
 
 
 def kill_vlc():
     global vlc_process, current_item_id
     if vlc_process and vlc_process.poll() is None:
         vlc_process.terminate()
-        vlc_process.wait(timeout=5)
+        try:
+            vlc_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            vlc_process.kill()
     vlc_process = None
     current_item_id = None
     # Kill any orphaned VLC processes from previous sessions
     subprocess.run(["pkill", "-f", "/usr/bin/vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def cec_monitor():
-    """Background thread: poll TV power status and stop VLC if TV turns off."""
-    while True:
-        time.sleep(5)
-        if vlc_process and vlc_process.poll() is None:
-            status = cec_tv_power_status()
-            if status != "on":
-                kill_vlc()
 
 
 @app.route("/play", methods=["POST"])
@@ -119,6 +181,10 @@ def play():
             "--no-video-title-show",
             "--aout=alsa",
             "--alsa-audio-device=plughw:1",
+            "--extraintf", "http",
+            "--http-host", "127.0.0.1",
+            "--http-port", str(VLC_HTTP_PORT),
+            "--http-password", VLC_HTTP_PASSWORD,
             stream_url,
             "vlc://quit",  # quit VLC when playback ends
         ],
@@ -140,6 +206,6 @@ def stop():
 if __name__ == "__main__":
     # Kill any orphaned VLC from previous sessions on startup
     subprocess.run(["pkill", "-f", "/usr/bin/vlc"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    # Start CEC monitor thread
-    threading.Thread(target=cec_monitor, daemon=True).start()
+    # Start the long-running cec-client (handles commands + remote key events + TV-off detection)
+    cec_start()
     app.run(host="0.0.0.0", port=5000)
