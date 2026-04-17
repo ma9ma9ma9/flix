@@ -223,6 +223,15 @@ def play():
     )
     current_item_id = item_id
 
+    # Re-assert active source after the TV has had more time to finish its
+    # own startup/CEC negotiation — avoids the TV briefly switching away
+    # from this input on cold start.
+    def deferred_active_source():
+        time.sleep(5)
+        cec_send("as")
+
+    threading.Thread(target=deferred_active_source, daemon=True).start()
+
     return jsonify({"status": "playing", "item_id": item_id, "pid": vlc_process.pid})
 
 
